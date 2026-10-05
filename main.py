@@ -131,7 +131,7 @@ async def photo_solver(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Unexpected photo solver error")
         await update.message.reply_text(
             "⚠️ Не удалось обработать фото.\n"
-            "Попробуй отправить более чёткое фото, где полностью видно условие."
+            "Попробуй ещё раз. Подробность ошибки записана в лог Bothost."
         )
 
 
