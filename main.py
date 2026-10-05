@@ -3,19 +3,18 @@ import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from subjects.chemistry import router as chemistry_router
-from ai_solver import solve_with_groq
+from ai_solver import solve_with_groq, GroqSolverError
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+logger = logging.getLogger(__name__)
 TOKEN = os.getenv("BOT_TOKEN")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("🧪 Химия 8–9 класс", callback_data="subject:chemistry")],
-    ]
+    keyboard = [[InlineKeyboardButton("🧪 Химия 8–9 класс", callback_data="subject:chemistry")]]
     await update.message.reply_text(
-        "📚 Школьный помощник 8–9 класса\n\n"
+        "📚 <b>Школьный помощник 8–9 класса</b>\n\n"
         "Выбери предмет или просто отправь мне задачу текстом.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML"
     )
 
 async def subject_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -25,42 +24,37 @@ async def subject_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await chemistry_router.show_menu(query)
 
 async def text_solver(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    question = update.message.text.strip()
+    question = (update.message.text or "").strip()
     if not question:
         return
-
     await update.message.chat.send_action("typing")
-
     try:
-        answer = await solve_with_groq(question)
-        await update.message.reply_text(answer)
-    except Exception as exc:
-        logging.exception("Groq error: %s", exc)
+        await update.message.reply_text(await solve_with_groq(question))
+    except GroqSolverError as exc:
+        logger.error("Groq solver error: %s", exc)
         await update.message.reply_text(
-            "⚠️ Не удалось получить решение. Проверь, что GROQ_API_KEY "
-            "правильно добавлен в настройках Bothost."
+            "⚠️ Не удалось решить задачу через ИИ.\n\n"
+            f"Причина: {exc}\n\n"
+            "Если проблема повторяется, проверь GROQ_API_KEY в Bothost."
+        )
+    except Exception:
+        logger.exception("Unexpected bot error")
+        await update.message.reply_text(
+            "⚠️ Произошла внутренняя ошибка бота.\n"
+            "Подробности записаны в лог Bothost."
         )
 
 def main():
     if not TOKEN:
-        raise RuntimeError("Не задан BOT_TOKEN.")
-
+        raise RuntimeError("BOT_TOKEN не задан. Добавь его в Bothost.")
     if not os.getenv("GROQ_API_KEY"):
-        raise RuntimeError("Не задан GROQ_API_KEY.")
-
+        raise RuntimeError("GROQ_API_KEY не задан. Добавь его в Bothost.")
     app = Application.builder().token(TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(
-        CallbackQueryHandler(subject_callback, pattern=r"^subject:")
-    )
+    app.add_handler(CallbackQueryHandler(subject_callback, pattern=r"^subject:"))
     chemistry_router.register(app)
-
-    # Любой обычный текст отправляем ИИ.
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, text_solver)
-    )
-
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_solver))
+    logger.info("Bot started")
     app.run_polling()
 
 if __name__ == "__main__":
