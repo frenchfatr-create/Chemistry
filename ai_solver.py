@@ -1,8 +1,10 @@
 import base64
+import io
 import os
 
 from groq import AsyncGroq
 from groq import APIConnectionError, APIStatusError, RateLimitError
+from PIL import Image
 
 MODEL = "openai/gpt-oss-120b"
 VISION_MODEL = "qwen/qwen3.8-27b"
@@ -26,21 +28,19 @@ SYSTEM_PROMPT = """
 """
 
 VISION_PROMPT = """
-Ты — школьный помощник для учеников 8–9 класса, который умеет читать задания с фотографий.
+Ты — школьный помощник 8–9 класса и умеешь читать задания с фотографий.
 
-На изображении может быть одно или несколько школьных заданий.
-Сначала внимательно прочитай текст, формулы, числа, таблицы и варианты ответа.
-Затем реши задание по изображению.
+Внимательно прочитай изображение: текст, числа, формулы, таблицы и варианты ответов.
+Затем реши задание полностью.
 
 Правила:
-- Если текст на фото плохо читается или часть условия обрезана, честно скажи, какая именно часть неразборчива.
-- Не придумывай числа, формулы или слова, которых на фото нет.
-- Если заданий несколько, реши их по порядку и явно раздели: «Задание 1», «Задание 2» и т.д.
-- Для химии: «Дано» → что найти → формулы/уравнение реакции → расчёты → «Ответ».
-- Для математики и физики: «Дано» → формулы → решение по шагам → «Ответ».
-- Для других предметов объясняй решение на уровне 8–9 класса.
-- Если на фото только условие без вопроса, объясни, что именно можно определить, и попроси уточнить, что нужно найти.
-- Не выдавай только конечный ответ, если задачу можно объяснить.
+- Не придумывай данные, которых нет на изображении.
+- Если часть условия действительно не читается, укажи конкретно, какая часть.
+- Если заданий несколько, раздели ответ на «Задание 1», «Задание 2» и т.д.
+- Для химии: Дано → что найти → формула/уравнение → расчёты → Ответ.
+- Для математики и физики: Дано → формулы → решение по шагам → Ответ.
+- Для теста указывай правильный вариант и кратко объясняй почему.
+- Отвечай по-русски.
 """
 
 class GroqSolverError(Exception):
@@ -49,20 +49,37 @@ class GroqSolverError(Exception):
 
 def _handle_groq_error(exc: Exception, model: str) -> GroqSolverError:
     if isinstance(exc, RateLimitError):
-        return GroqSolverError("Превышен бесплатный лимит Groq. Попробуй позже.")
+        # У Groq бесплатный лимит может сработать как по запросам, так и по токенам.
+        return GroqSolverError(
+            "Groq временно ограничил запрос (429): превышен лимит запросов или токенов. "
+            "Подожди немного и попробуй снова."
+        )
     if isinstance(exc, APIStatusError):
-        if exc.status_code == 401:
+        status = getattr(exc, "status_code", "?")
+        body = getattr(exc, "body", None)
+        detail = ""
+        if isinstance(body, dict):
+            err = body.get("error")
+            if isinstance(err, dict):
+                detail = err.get("message") or err.get("code") or ""
+            elif isinstance(err, str):
+                detail = err
+        if status == 400:
+            return GroqSolverError(
+                f"Groq отклонил запрос (400). {detail or 'Проверь размер/формат изображения.'}"
+            )
+        if status == 401:
             return GroqSolverError("Groq отклонил API-ключ (401). Проверь GROQ_API_KEY.")
-        if exc.status_code == 403:
+        if status == 403:
             return GroqSolverError("Groq запретил запрос (403). Проверь аккаунт и API-ключ.")
-        if exc.status_code == 404:
+        if status == 404:
             return GroqSolverError(f"Модель {model} не найдена (404).")
-        if exc.status_code == 413:
-            return GroqSolverError("Фото слишком большое для Groq. Отправь фото меньшего размера.")
-        return GroqSolverError(f"Groq вернул HTTP {exc.status_code}.")
+        if status == 413:
+            return GroqSolverError("Запрос с фото слишком большой. Отправь фото меньшего размера.")
+        return GroqSolverError(f"Groq вернул HTTP {status}. {detail}".strip())
     if isinstance(exc, APIConnectionError):
         return GroqSolverError("Не удалось подключиться к Groq. Попробуй ещё раз.")
-    return GroqSolverError(f"Ошибка Groq: {type(exc).__name__}.")
+    return GroqSolverError(f"Ошибка Groq: {type(exc).__name__}: {exc}")
 
 
 def _check_response(response):
@@ -74,6 +91,28 @@ def _check_response(response):
     return answer.strip()
 
 
+def _prepare_image(image_bytes: bytes) -> str:
+    """Сжимает/перекодирует фото в JPEG, чтобы запрос был небольшим и стабильным."""
+    try:
+        image = Image.open(io.BytesIO(image_bytes))
+        image = image.convert("RGB")
+        image.thumbnail((2400, 2400), Image.Resampling.LANCZOS)
+
+        out = io.BytesIO()
+        quality = 88
+        image.save(out, format="JPEG", quality=quality, optimize=True)
+
+        # Держим запас до лимита Groq 20 MB.
+        while out.tell() > 8 * 1024 * 1024 and quality > 55:
+            quality -= 8
+            out = io.BytesIO()
+            image.save(out, format="JPEG", quality=quality, optimize=True)
+
+        return base64.b64encode(out.getvalue()).decode("utf-8")
+    except Exception as exc:
+        raise GroqSolverError(f"Не удалось подготовить изображение: {exc}")
+
+
 async def solve_with_groq(question: str, history=None) -> str:
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
@@ -82,14 +121,14 @@ async def solve_with_groq(question: str, history=None) -> str:
     client = AsyncGroq(api_key=api_key)
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     if history:
-        messages.extend(history)
+        messages.extend(history[-20:])
     messages.append({"role": "user", "content": question})
     try:
         response = await client.chat.completions.create(
             model=MODEL,
             messages=messages,
             temperature=0.2,
-            max_tokens=1800,
+            max_completion_tokens=1800,
         )
     except Exception as exc:
         raise _handle_groq_error(exc, MODEL)
@@ -98,44 +137,45 @@ async def solve_with_groq(question: str, history=None) -> str:
 
 
 async def solve_image_with_groq(image_bytes: bytes, caption: str = "", history=None) -> str:
-    """Решает школьную задачу по фото через мультимодальную модель Groq."""
+    """Решает школьную задачу по фото через Qwen 3.8 27B Vision."""
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
         raise GroqSolverError("Переменная GROQ_API_KEY не задана.")
-
     if not image_bytes:
         raise GroqSolverError("Фото пустое.")
 
-    # Telegram присылает фото как JPEG через обычный photo handler.
-    base64_image = base64.b64encode(image_bytes).decode("utf-8")
+    base64_image = _prepare_image(image_bytes)
     image_data_url = f"data:image/jpeg;base64,{base64_image}"
 
     user_text = (
-        "Прочитай задание на фото и реши его полностью, пошагово."
+        "Прочитай всё задание на фото и реши его полностью, пошагово."
         if not caption
-        else f"Комментарий ученика к фото: {caption}\n\nПрочитай задание на фото и реши его полностью."
+        else f"Комментарий ученика к фото: {caption}\n\nПрочитай всё задание на фото и реши его полностью."
     )
 
     client = AsyncGroq(api_key=api_key)
+
+    # Для vision передаём только последние несколько сообщений:
+    # это сохраняет смысл диалога, но не забивает бесплатный TPM-лимит Groq.
     messages = [{"role": "system", "content": VISION_PROMPT}]
     if history:
-        messages.extend(history)
+        messages.extend(history[-6:])
     messages.append({
         "role": "user",
         "content": [
-                        {"type": "text", "text": user_text},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": image_data_url},
-                        },
-                    ],
+            {"type": "text", "text": user_text},
+            {"type": "image_url", "image_url": {"url": image_data_url}},
+        ],
     })
+
     try:
         response = await client.chat.completions.create(
             model=VISION_MODEL,
             messages=messages,
-            temperature=0.2,
-            max_completion_tokens=3000,
+            temperature=1.0,
+            max_completion_tokens=1800,
+            reasoning_effort="medium",
+            reasoning_format="hidden",
         )
     except Exception as exc:
         raise _handle_groq_error(exc, VISION_MODEL)
